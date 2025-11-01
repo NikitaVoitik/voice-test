@@ -1,6 +1,10 @@
 import { CartesiaClient } from "@cartesia/cartesia-js";
 import { type NextRequest, NextResponse } from "next/server";
 
+// Default voice: Barbershop Man
+const DEFAULT_VOICE_ID = "a0e99841-438c-4a64-b679-ae501e7d6091";
+const DEFAULT_MODEL_ID = "sonic-english";
+
 export async function POST(request: NextRequest) {
   try {
     const { text } = await request.json();
@@ -21,13 +25,15 @@ export async function POST(request: NextRequest) {
       apiKey: apiKey,
     });
 
-    // Using a default voice
+    const voiceId = process.env.CARTESIA_VOICE_ID || DEFAULT_VOICE_ID;
+    const modelId = process.env.CARTESIA_MODEL_ID || DEFAULT_MODEL_ID;
+
     const response = await cartesia.tts.bytes({
-      modelId: "sonic-english",
+      modelId,
       transcript: text,
       voice: {
         mode: "id",
-        id: "a0e99841-438c-4a64-b679-ae501e7d6091", // Barbershop Man
+        id: voiceId,
       },
       outputFormat: {
         container: "mp3",

@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 export default function Home() {
   const [text, setText] = useState("");
@@ -9,6 +9,18 @@ export default function Home() {
   const [elevenLabsAudio, setElevenLabsAudio] = useState<string | null>(null);
   const [cartesiaAudio, setCartesiaAudio] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+
+  // Cleanup URLs when component unmounts or URLs change
+  useEffect(() => {
+    return () => {
+      if (elevenLabsAudio) {
+        URL.revokeObjectURL(elevenLabsAudio);
+      }
+      if (cartesiaAudio) {
+        URL.revokeObjectURL(cartesiaAudio);
+      }
+    };
+  }, [elevenLabsAudio, cartesiaAudio]);
 
   const generateAudio = async (provider: "elevenlabs" | "cartesia") => {
     if (!text.trim()) {
@@ -20,6 +32,7 @@ export default function Home() {
     const isElevenLabs = provider === "elevenlabs";
     const setLoading = isElevenLabs ? setElevenLabsLoading : setCartesiaLoading;
     const setAudio = isElevenLabs ? setElevenLabsAudio : setCartesiaAudio;
+    const currentAudio = isElevenLabs ? elevenLabsAudio : cartesiaAudio;
 
     setLoading(true);
 
@@ -39,6 +52,12 @@ export default function Home() {
 
       const blob = await response.blob();
       const audioUrl = URL.createObjectURL(blob);
+
+      // Revoke old URL before setting new one
+      if (currentAudio) {
+        URL.revokeObjectURL(currentAudio);
+      }
+
       setAudio(audioUrl);
     } catch (err) {
       setError(
