@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, useRef, useCallback } from "react";
 
 // ElevenLabs voice options
 const ELEVENLABS_VOICES = [
@@ -41,7 +41,6 @@ const CARTESIA_MODELS = [
 ];
 
 export default function Home() {
-  const [text, setText] = useState("");
   const [elevenLabsLoading, setElevenLabsLoading] = useState(false);
   const [cartesiaLoading, setCartesiaLoading] = useState(false);
   const [elevenLabsAudio, setElevenLabsAudio] = useState<string | null>(null);
@@ -55,7 +54,23 @@ export default function Home() {
   // Cartesia selection state
   const [cartesiaVoiceId, setCartesiaVoiceId] = useState(CARTESIA_VOICES[0].id);
   const [cartesiaModelId, setCartesiaModelId] = useState(CARTESIA_MODELS[0].id);
+  
+  // Audio recording state
+  const [isRecording, setIsRecording] = useState(false);
+  const [elevenLabsTranscript, setElevenLabsTranscript] = useState("");
+  const [cartesiaTranscript, setCartesiaTranscript] = useState("");
+  const [transcribing, setTranscribing] = useState(false);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const audioChunksRef = useRef<Blob[]>([]);
+  
+  // Timing measurements
+  const [elevenLabsTranscribeTime, setElevenLabsTranscribeTime] = useState<number | null>(null);
+  const [cartesiaTranscribeTime, setCartesiaTranscribeTime] = useState<number | null>(null);
+  const [elevenLabsAudioTime, setElevenLabsAudioTime] = useState<number | null>(null);
+  const [cartesiaAudioTime, setCartesiaAudioTime] = useState<number | null>(null);
 
+  // No initialization needed for MediaRecorder
+  
   // Cleanup URLs when component unmounts or URLs change
   useEffect(() => {
     return () => {
@@ -65,28 +80,136 @@ export default function Home() {
       if (cartesiaAudio) {
         URL.revokeObjectURL(cartesiaAudio);
       }
+      if (mediaRecorderRef.current && isRecording) {
+        mediaRecorderRef.current.stop();
+      }
     };
-  }, [elevenLabsAudio, cartesiaAudio]);
+  }, [elevenLabsAudio, cartesiaAudio, isRecording]);
 
-  const generateAudio = async (provider: "elevenlabs" | "cartesia") => {
-    if (!text.trim()) {
-      setError("Please enter some text");
-      return;
+  const toggleRecording = useCallback(async () => {
+    if (isRecording) {
+      // Stop recording
+      if (mediaRecorderRef.current) {
+        mediaRecorderRef.current.stop();
+      }
+    } else {
+      // Start recording
+      setError(null);
+      setElevenLabsTranscript("");
+      setCartesiaTranscript("");
+      audioChunksRef.current = [];
+      
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        const mediaRecorder = new MediaRecorder(stream);
+        mediaRecorderRef.current = mediaRecorder;
+        
+        mediaRecorder.ondataavailable = (event) => {
+          if (event.data.size > 0) {
+            audioChunksRef.current.push(event.data);
+          }
+        };
+        
+        mediaRecorder.onstop = async () => {
+          const audioBlob = new Blob(audioChunksRef.current, { type: "audio/webm" });
+          
+          // Stop all tracks
+          stream.getTracks().forEach(track => track.stop());
+          
+          // Set recording to false immediately
+          setIsRecording(false);
+          
+          // Reset timing measurements
+          setElevenLabsTranscribeTime(null);
+          setCartesiaTranscribeTime(null);
+          setElevenLabsAudioTime(null);
+          setCartesiaAudioTime(null);
+          
+          // Transcribe with both services in parallel
+          setTranscribing(true);
+          const transcribeStartTime = performance.now();
+          
+          try {
+            const [elevenLabsResult, cartesiaResult] = await Promise.allSettled([
+              transcribeAudio(audioBlob, "elevenlabs", transcribeStartTime),
+              transcribeAudio(audioBlob, "cartesia", transcribeStartTime),
+            ]);
+            
+            if (elevenLabsResult.status === "fulfilled") {
+              setElevenLabsTranscript(elevenLabsResult.value);
+              // Auto-generate ElevenLabs audio
+              if (elevenLabsResult.value.trim()) {
+                generateAudioFromTranscript(elevenLabsResult.value, "elevenlabs");
+              }
+            } else {
+              console.error("ElevenLabs transcription failed:", elevenLabsResult.reason);
+              setError("ElevenLabs transcription failed");
+            }
+            
+            if (cartesiaResult.status === "fulfilled") {
+              setCartesiaTranscript(cartesiaResult.value);
+              // Auto-generate Cartesia audio
+              if (cartesiaResult.value.trim()) {
+                generateAudioFromTranscript(cartesiaResult.value, "cartesia");
+              }
+            } else {
+              console.error("Cartesia transcription failed:", cartesiaResult.reason);
+              setError("Cartesia transcription failed");
+            }
+          } finally {
+            setTranscribing(false);
+          }
+        };
+        
+        mediaRecorder.start();
+        setIsRecording(true);
+      } catch (err) {
+        console.error("Failed to start recording:", err);
+        setError("Failed to access microphone. Please allow microphone access.");
+      }
     }
-
-    setError(null);
+  }, [isRecording, elevenLabsVoiceId, elevenLabsModelId, cartesiaVoiceId, cartesiaModelId]);
+  
+  const transcribeAudio = async (audioBlob: Blob, provider: "elevenlabs" | "cartesia", startTime: number): Promise<string> => {
+    const formData = new FormData();
+    formData.append("audio", audioBlob, "recording.webm");
+    
+    const response = await fetch(`/api/${provider}-transcribe`, {
+      method: "POST",
+      body: formData,
+    });
+    
+    if (!response.ok) {
+      throw new Error(`${provider} transcription failed`);
+    }
+    
+    const result = await response.json();
+    const transcribeTime = performance.now() - startTime;
+    
+    // Set transcription time
+    if (provider === "elevenlabs") {
+      setElevenLabsTranscribeTime(transcribeTime);
+    } else {
+      setCartesiaTranscribeTime(transcribeTime);
+    }
+    
+    return result.text;
+  };
+  
+  const generateAudioFromTranscript = async (transcript: string, provider: "elevenlabs" | "cartesia") => {
     const isElevenLabs = provider === "elevenlabs";
     const setLoading = isElevenLabs ? setElevenLabsLoading : setCartesiaLoading;
     const setAudio = isElevenLabs ? setElevenLabsAudio : setCartesiaAudio;
     const currentAudio = isElevenLabs ? elevenLabsAudio : cartesiaAudio;
-
+    
     setLoading(true);
-
+    const audioStartTime = performance.now();
+    
     try {
       const requestBody = isElevenLabs
-        ? { text, voiceId: elevenLabsVoiceId, modelId: elevenLabsModelId }
-        : { text, voiceId: cartesiaVoiceId, modelId: cartesiaModelId };
-
+        ? { text: transcript, voiceId: elevenLabsVoiceId, modelId: elevenLabsModelId }
+        : { text: transcript, voiceId: cartesiaVoiceId, modelId: cartesiaModelId };
+      
       const response = await fetch(`/api/${provider}`, {
         method: "POST",
         headers: {
@@ -94,29 +217,36 @@ export default function Home() {
         },
         body: JSON.stringify(requestBody),
       });
-
+      
       if (!response.ok) {
         const errorData = await response.json();
         throw new Error(errorData.error || "Failed to generate audio");
       }
-
+      
       const blob = await response.blob();
       const audioUrl = URL.createObjectURL(blob);
-
-      // Revoke old URL before setting new one
+      
+      const audioTime = performance.now() - audioStartTime;
+      
+      // Set audio generation time
+      if (isElevenLabs) {
+        setElevenLabsAudioTime(audioTime);
+      } else {
+        setCartesiaAudioTime(audioTime);
+      }
+      
       if (currentAudio) {
         URL.revokeObjectURL(currentAudio);
       }
-
+      
       setAudio(audioUrl);
     } catch (err) {
-      setError(
-        err instanceof Error ? err.message : "An unknown error occurred",
-      );
+      console.error(`${provider} audio generation error:`, err);
     } finally {
       setLoading(false);
     }
   };
+  
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 dark:from-gray-900 dark:to-gray-800 py-12 px-4">
@@ -131,19 +261,62 @@ export default function Home() {
         </div>
 
         <div className="bg-white dark:bg-gray-800 rounded-lg shadow-lg p-6 mb-6">
-          <label
-            htmlFor="text-input"
-            className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2"
-          >
-            Enter text to convert to speech:
-          </label>
-          <textarea
-            id="text-input"
-            value={text}
-            onChange={(e) => setText(e.target.value)}
-            placeholder="Type something here..."
-            className="w-full h-32 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-transparent dark:bg-gray-700 dark:text-white resize-none"
-          />
+          <div className="flex justify-between items-center mb-2">
+            <label
+              htmlFor="text-input"
+              className="block text-sm font-medium text-gray-700 dark:text-gray-300"
+            >
+              Record audio for parallel transcription:
+            </label>
+            <button
+              type="button"
+              onClick={toggleRecording}
+              disabled={transcribing}
+              className={`px-4 py-2 rounded-lg font-medium transition-colors ${
+                isRecording
+                  ? "bg-red-600 hover:bg-red-700 text-white"
+                  : "bg-green-600 hover:bg-green-700 text-white disabled:bg-gray-400"
+              }`}
+            >
+              {isRecording ? "🔴 Stop Recording" : "🎤 Start Recording"}
+            </button>
+          </div>
+          {isRecording && (
+            <div className="mb-2 text-sm text-red-600 dark:text-red-400 font-medium animate-pulse">
+              🔴 Recording... Speak now!
+            </div>
+          )}
+          {transcribing && (
+            <div className="mb-2 text-sm text-blue-600 dark:text-blue-400 font-medium">
+              ⏳ Transcribing with both services...
+            </div>
+          )}
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
+            <div>
+              <label className="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">
+                ElevenLabs Transcript:
+              </label>
+              <textarea
+                value={elevenLabsTranscript}
+                onChange={(e) => setElevenLabsTranscript(e.target.value)}
+                placeholder="ElevenLabs transcription will appear here..."
+                className="w-full h-24 px-3 py-2 text-sm border border-indigo-300 dark:border-indigo-600 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-transparent dark:bg-gray-700 dark:text-white resize-none"
+                disabled={isRecording || transcribing}
+              />
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">
+                Cartesia Transcript:
+              </label>
+              <textarea
+                value={cartesiaTranscript}
+                onChange={(e) => setCartesiaTranscript(e.target.value)}
+                placeholder="Cartesia transcription will appear here..."
+                className="w-full h-24 px-3 py-2 text-sm border border-purple-300 dark:border-purple-600 rounded-lg focus:ring-2 focus:ring-purple-500 focus:border-transparent dark:bg-gray-700 dark:text-white resize-none"
+                disabled={isRecording || transcribing}
+              />
+            </div>
+          </div>
         </div>
 
         {error && (
@@ -203,12 +376,34 @@ export default function Home() {
             
             <button
               type="button"
-              onClick={() => generateAudio("elevenlabs")}
-              disabled={elevenLabsLoading || !text.trim()}
+              onClick={() => generateAudioFromTranscript(elevenLabsTranscript, "elevenlabs")}
+              disabled={elevenLabsLoading || !elevenLabsTranscript.trim()}
               className="w-full bg-indigo-600 hover:bg-indigo-700 disabled:bg-gray-400 text-white font-medium py-3 px-4 rounded-lg transition-colors mb-4"
             >
-              {elevenLabsLoading ? "Generating..." : "Generate Audio"}
+              {elevenLabsLoading ? "Generating..." : "Regenerate Audio"}
             </button>
+            
+            {(elevenLabsTranscribeTime !== null || elevenLabsAudioTime !== null) && (
+              <div className="mb-4 p-3 bg-indigo-50 dark:bg-indigo-900/20 rounded-lg text-sm">
+                <div className="font-semibold text-indigo-900 dark:text-indigo-100 mb-1">⏱️ Timing:</div>
+                {elevenLabsTranscribeTime !== null && (
+                  <div className="text-indigo-700 dark:text-indigo-300">
+                    Transcription: <span className="font-mono font-bold">{(elevenLabsTranscribeTime / 1000).toFixed(2)}s</span>
+                  </div>
+                )}
+                {elevenLabsAudioTime !== null && (
+                  <div className="text-indigo-700 dark:text-indigo-300">
+                    Audio Generation: <span className="font-mono font-bold">{(elevenLabsAudioTime / 1000).toFixed(2)}s</span>
+                  </div>
+                )}
+                {elevenLabsTranscribeTime !== null && elevenLabsAudioTime !== null && (
+                  <div className="text-indigo-900 dark:text-indigo-100 font-semibold mt-1">
+                    Total: <span className="font-mono font-bold">{((elevenLabsTranscribeTime + elevenLabsAudioTime) / 1000).toFixed(2)}s</span>
+                  </div>
+                )}
+              </div>
+            )}
+            
             {elevenLabsAudio && (
               <div className="mt-4">
                 {/* biome-ignore lint/a11y/useMediaCaption: The audio is generated from the text input which serves as the caption */}
@@ -270,12 +465,34 @@ export default function Home() {
             
             <button
               type="button"
-              onClick={() => generateAudio("cartesia")}
-              disabled={cartesiaLoading || !text.trim()}
+              onClick={() => generateAudioFromTranscript(cartesiaTranscript, "cartesia")}
+              disabled={cartesiaLoading || !cartesiaTranscript.trim()}
               className="w-full bg-purple-600 hover:bg-purple-700 disabled:bg-gray-400 text-white font-medium py-3 px-4 rounded-lg transition-colors mb-4"
             >
-              {cartesiaLoading ? "Generating..." : "Generate Audio"}
+              {cartesiaLoading ? "Generating..." : "Regenerate Audio"}
             </button>
+            
+            {(cartesiaTranscribeTime !== null || cartesiaAudioTime !== null) && (
+              <div className="mb-4 p-3 bg-purple-50 dark:bg-purple-900/20 rounded-lg text-sm">
+                <div className="font-semibold text-purple-900 dark:text-purple-100 mb-1">⏱️ Timing:</div>
+                {cartesiaTranscribeTime !== null && (
+                  <div className="text-purple-700 dark:text-purple-300">
+                    Transcription: <span className="font-mono font-bold">{(cartesiaTranscribeTime / 1000).toFixed(2)}s</span>
+                  </div>
+                )}
+                {cartesiaAudioTime !== null && (
+                  <div className="text-purple-700 dark:text-purple-300">
+                    Audio Generation: <span className="font-mono font-bold">{(cartesiaAudioTime / 1000).toFixed(2)}s</span>
+                  </div>
+                )}
+                {cartesiaTranscribeTime !== null && cartesiaAudioTime !== null && (
+                  <div className="text-purple-900 dark:text-purple-100 font-semibold mt-1">
+                    Total: <span className="font-mono font-bold">{((cartesiaTranscribeTime + cartesiaAudioTime) / 1000).toFixed(2)}s</span>
+                  </div>
+                )}
+              </div>
+            )}
+            
             {cartesiaAudio && (
               <div className="mt-4">
                 {/* biome-ignore lint/a11y/useMediaCaption: The audio is generated from the text input which serves as the caption */}
