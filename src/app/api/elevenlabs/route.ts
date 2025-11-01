@@ -7,7 +7,7 @@ const DEFAULT_MODEL_ID = "eleven_monolingual_v1";
 
 export async function POST(request: NextRequest) {
   try {
-    const { text } = await request.json();
+    const { text, voiceId, modelId } = await request.json();
 
     if (!text) {
       return NextResponse.json({ error: "Text is required" }, { status: 400 });
@@ -23,12 +23,12 @@ export async function POST(request: NextRequest) {
 
     const client = new ElevenLabsClient({ apiKey });
 
-    const voiceId = process.env.ELEVENLABS_VOICE_ID || DEFAULT_VOICE_ID;
-    const modelId = process.env.ELEVENLABS_MODEL_ID || DEFAULT_MODEL_ID;
+    const selectedVoiceId = voiceId || process.env.ELEVENLABS_VOICE_ID || DEFAULT_VOICE_ID;
+    const selectedModelId = modelId || process.env.ELEVENLABS_MODEL_ID || DEFAULT_MODEL_ID;
 
-    const audio = await client.textToSpeech.convert(voiceId, {
+    const audio = await client.textToSpeech.convert(selectedVoiceId, {
       text,
-      modelId,
+      modelId: selectedModelId,
     });
 
     // Convert the audio stream to buffer

@@ -7,7 +7,7 @@ const DEFAULT_MODEL_ID = "sonic-english";
 
 export async function POST(request: NextRequest) {
   try {
-    const { text } = await request.json();
+    const { text, voiceId, modelId } = await request.json();
 
     if (!text) {
       return NextResponse.json({ error: "Text is required" }, { status: 400 });
@@ -25,15 +25,15 @@ export async function POST(request: NextRequest) {
       apiKey: apiKey,
     });
 
-    const voiceId = process.env.CARTESIA_VOICE_ID || DEFAULT_VOICE_ID;
-    const modelId = process.env.CARTESIA_MODEL_ID || DEFAULT_MODEL_ID;
+    const selectedVoiceId = voiceId || process.env.CARTESIA_VOICE_ID || DEFAULT_VOICE_ID;
+    const selectedModelId = modelId || process.env.CARTESIA_MODEL_ID || DEFAULT_MODEL_ID;
 
     const response = await cartesia.tts.bytes({
-      modelId,
+      modelId: selectedModelId,
       transcript: text,
       voice: {
         mode: "id",
-        id: voiceId,
+        id: selectedVoiceId,
       },
       outputFormat: {
         container: "mp3",
