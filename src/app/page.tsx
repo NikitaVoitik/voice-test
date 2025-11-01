@@ -64,6 +64,19 @@ export default function Home() {
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   
+  // Audio streaming state
+  const elevenLabsAudioContextRef = useRef<AudioContext | null>(null);
+  const cartesiaAudioContextRef = useRef<AudioContext | null>(null);
+  const elevenLabsSourceRef = useRef<AudioBufferSourceNode | null>(null);
+  const cartesiaSourceRef = useRef<AudioBufferSourceNode | null>(null);
+  const [isGeneratingAudio, setIsGeneratingAudio] = useState(false);
+  const keepaliveIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  
+  // OpenAI streaming state
+  const [openAIResponse, setOpenAIResponse] = useState("");
+  const [isStreamingOpenAI, setIsStreamingOpenAI] = useState(false);
+  const openAIAbortControllerRef = useRef<AbortController | null>(null);
+  
   // Timing measurements
   const [elevenLabsAudioTime, setElevenLabsAudioTime] = useState<number | null>(null);
   const [cartesiaAudioTime, setCartesiaAudioTime] = useState<number | null>(null);
@@ -76,6 +89,9 @@ export default function Home() {
       }
       if (cartesiaAudio) {
         URL.revokeObjectURL(cartesiaAudio);
+      }
+      if (keepaliveIntervalRef.current) {
+        clearInterval(keepaliveIntervalRef.current);
       }
       if (deepgramConnectionRef.current) {
         deepgramConnectionRef.current.finish();
@@ -90,6 +106,11 @@ export default function Home() {
     if (isRecording) {
       // Stop recording
       setIsRecording(false);
+      
+      if (keepaliveIntervalRef.current) {
+        clearInterval(keepaliveIntervalRef.current);
+        keepaliveIntervalRef.current = null;
+      }
       
       if (deepgramConnectionRef.current) {
         deepgramConnectionRef.current.finish();
@@ -109,45 +130,97 @@ export default function Home() {
       setCartesiaAudioTime(null);
       
       try {
+        // Get microphone stream first
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        mediaStreamRef.current = stream;
+        console.log("Microphone stream obtained:", stream.getAudioTracks().length, "audio tracks");
+        
+        // Create MediaRecorder BEFORE establishing Deepgram connection
+        const mediaRecorder = new MediaRecorder(stream, {
+          mimeType: "audio/webm",
+        });
+        mediaRecorderRef.current = mediaRecorder;
+        console.log("MediaRecorder created");
+        
+        mediaRecorder.ondataavailable = (event) => {
+          if (event.data.size > 0 && deepgramConnectionRef.current) {
+            console.log("Sending audio chunk to Deepgram:", event.data.size, "bytes");
+            deepgramConnectionRef.current.send(event.data);
+          }
+        };
+        
+        mediaRecorder.onerror = (event) => {
+          console.error("MediaRecorder error:", event);
+        };
+        
         // Get API key from backend
         const keyResponse = await fetch("/api/deepgram");
         if (!keyResponse.ok) {
           throw new Error("Failed to get Deepgram API key");
         }
         const { key } = await keyResponse.json();
+        console.log("Deepgram API key obtained");
         
-        // Create Deepgram client
+        // Create Deepgram client and connection
         const deepgram = createClient(key);
         const connection = deepgram.listen.live({
           model: "nova-2",
           language: "en-US",
           smart_format: true,
           interim_results: true,
+          keepalive: true,
         });
         
         deepgramConnectionRef.current = connection;
         
         // Set up event listeners
         connection.on(LiveTranscriptionEvents.Open, () => {
-          console.log("Deepgram connection opened");
+          console.log("Deepgram WebSocket connection opened");
           setIsConnecting(false);
           setIsRecording(true);
+          
+          // Start sending audio immediately when connection opens
+          if (mediaRecorderRef.current && mediaRecorderRef.current.state === "inactive") {
+            console.log("Starting MediaRecorder...");
+            mediaRecorderRef.current.start(250);
+            console.log("MediaRecorder started, state:", mediaRecorderRef.current.state);
+          } else {
+            console.warn("MediaRecorder not ready or already started:", mediaRecorderRef.current?.state);
+          }
+          
+          // Set up keepalive to prevent connection timeout
+          keepaliveIntervalRef.current = setInterval(() => {
+            if (deepgramConnectionRef.current) {
+              try {
+                // Send keepalive message
+                deepgramConnectionRef.current.keepAlive();
+                console.log("Keepalive sent to Deepgram");
+              } catch (e) {
+                console.error("Failed to send keepalive:", e);
+              }
+            }
+          }, 5000); // Send keepalive every 5 seconds
         });
         
         connection.on(LiveTranscriptionEvents.Transcript, (data) => {
           const transcript = data.channel.alternatives[0].transcript;
           if (transcript && transcript.trim().length > 0) {
+            console.log("Transcript received:", transcript, "is_final:", data.is_final);
             setTranscript((prev) => {
-              if (data.is_final) {
-                return prev + (prev ? " " : "") + transcript;
-              }
-              return prev;
+              const newTranscript = data.is_final 
+                ? prev + (prev ? " " : "") + transcript
+                : prev;
+              
+              // Don't auto-generate audio from transcript anymore
+              // User will manually submit the prompt
+              
+              return newTranscript;
             });
           }
         });
         
         connection.on(LiveTranscriptionEvents.Metadata, (data) => {
-          console.log("Deepgram metadata:", data);
+          console.log("Deepgram metadata:", JSON.stringify(data, null, 2));
         });
         
         connection.on(LiveTranscriptionEvents.Error, (error) => {
@@ -155,31 +228,21 @@ export default function Home() {
           setError("Transcription error occurred");
           setIsRecording(false);
           setIsConnecting(false);
+          if (keepaliveIntervalRef.current) {
+            clearInterval(keepaliveIntervalRef.current);
+            keepaliveIntervalRef.current = null;
+          }
         });
         
-        connection.on(LiveTranscriptionEvents.Close, () => {
-          console.log("Deepgram connection closed");
+        connection.on(LiveTranscriptionEvents.Close, (event) => {
+          console.log("Deepgram connection closed:", event);
           setIsRecording(false);
           setIsConnecting(false);
-        });
-        
-        // Get microphone stream
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        mediaStreamRef.current = stream;
-        
-        // Create MediaRecorder to send audio to Deepgram
-        const mediaRecorder = new MediaRecorder(stream, {
-          mimeType: "audio/webm",
-        });
-        mediaRecorderRef.current = mediaRecorder;
-        
-        mediaRecorder.ondataavailable = (event) => {
-          if (event.data.size > 0 && deepgramConnectionRef.current) {
-            deepgramConnectionRef.current.send(event.data);
+          if (keepaliveIntervalRef.current) {
+            clearInterval(keepaliveIntervalRef.current);
+            keepaliveIntervalRef.current = null;
           }
-        };
-        
-        mediaRecorder.start(250); // Send data every 250ms
+        });
       } catch (err) {
         console.error("Failed to start recording:", err);
         setError("Failed to access microphone or connect to Deepgram. Please check your setup.");
@@ -189,19 +252,117 @@ export default function Home() {
     }
   }, [isRecording]);
   
-  const generateAudioFromTranscript = async (text: string, provider: "elevenlabs" | "cartesia") => {
+  const handleSubmitPrompt = async () => {
+    if (!transcript.trim() || isStreamingOpenAI) return;
+    
+    setOpenAIResponse("");
+    setIsStreamingOpenAI(true);
+    setElevenLabsLoading(true);
+    setCartesiaLoading(true);
+    setElevenLabsAudio(null);
+    setCartesiaAudio(null);
+    
+    const abortController = new AbortController();
+    openAIAbortControllerRef.current = abortController;
+    
+    try {
+      // Start streaming from OpenAI
+      const response = await fetch("/api/openai", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prompt: transcript }),
+        signal: abortController.signal,
+      });
+      
+      if (!response.ok) {
+        throw new Error("Failed to get OpenAI response");
+      }
+      
+      const reader = response.body?.getReader();
+      if (!reader) throw new Error("No response body");
+      
+      const decoder = new TextDecoder();
+      let accumulatedText = "";
+      let buffer = "";
+      
+      // Start audio generation for both providers
+      const elevenLabsChunks: string[] = [];
+      const cartesiaChunks: string[] = [];
+      
+      const elevenLabsStartTime = performance.now();
+      const cartesiaStartTime = performance.now();
+      
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
+        
+        for (const line of lines) {
+          if (line.trim()) {
+            try {
+              const { content } = JSON.parse(line);
+              accumulatedText += content;
+              setOpenAIResponse(accumulatedText);
+              
+              // Accumulate chunks for voice generation
+              elevenLabsChunks.push(content);
+              cartesiaChunks.push(content);
+            } catch (e) {
+              console.error("Failed to parse chunk:", e);
+            }
+          }
+        }
+      }
+      
+      // Generate audio from the complete response
+      if (accumulatedText.trim()) {
+        const elevenLabsPromise = streamAudioFromProvider(
+          accumulatedText,
+          "elevenlabs",
+          elevenLabsVoiceId,
+          elevenLabsModelId,
+          elevenLabsStartTime
+        );
+        
+        const cartesiaPromise = streamAudioFromProvider(
+          accumulatedText,
+          "cartesia",
+          cartesiaVoiceId,
+          cartesiaModelId,
+          cartesiaStartTime
+        );
+        
+        await Promise.all([elevenLabsPromise, cartesiaPromise]);
+      }
+    } catch (err: any) {
+      if (err.name !== "AbortError") {
+        console.error("OpenAI streaming error:", err);
+        setError("Failed to get response from OpenAI");
+      }
+    } finally {
+      setIsStreamingOpenAI(false);
+      openAIAbortControllerRef.current = null;
+    }
+  };
+  
+  const streamAudioFromProvider = async (
+    text: string,
+    provider: "elevenlabs" | "cartesia",
+    voiceId: string,
+    modelId: string,
+    startTime: number
+  ) => {
     const isElevenLabs = provider === "elevenlabs";
     const setLoading = isElevenLabs ? setElevenLabsLoading : setCartesiaLoading;
     const setAudio = isElevenLabs ? setElevenLabsAudio : setCartesiaAudio;
     const currentAudio = isElevenLabs ? elevenLabsAudio : cartesiaAudio;
-    
-    setLoading(true);
-    const audioStartTime = performance.now();
+    const setAudioTime = isElevenLabs ? setElevenLabsAudioTime : setCartesiaAudioTime;
     
     try {
-      const requestBody = isElevenLabs
-        ? { text, voiceId: elevenLabsVoiceId, modelId: elevenLabsModelId }
-        : { text, voiceId: cartesiaVoiceId, modelId: cartesiaModelId };
+      const requestBody = { text, voiceId, modelId };
       
       const response = await fetch(`/api/${provider}`, {
         method: "POST",
@@ -216,17 +377,28 @@ export default function Home() {
         throw new Error(errorData.error || "Failed to generate audio");
       }
       
-      const blob = await response.blob();
+      // Stream the audio response
+      const reader = response.body?.getReader();
+      if (!reader) {
+        throw new Error("No response body");
+      }
+      
+      const chunks: Uint8Array[] = [];
+      
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value) {
+          chunks.push(value);
+        }
+      }
+      
+      // Combine all chunks into a single blob
+      const blob = new Blob(chunks, { type: "audio/mpeg" });
       const audioUrl = URL.createObjectURL(blob);
       
-      const audioTime = performance.now() - audioStartTime;
-      
-      // Set audio generation time
-      if (isElevenLabs) {
-        setElevenLabsAudioTime(audioTime);
-      } else {
-        setCartesiaAudioTime(audioTime);
-      }
+      const audioTime = performance.now() - startTime;
+      setAudioTime(audioTime);
       
       if (currentAudio) {
         URL.revokeObjectURL(currentAudio);
@@ -238,6 +410,21 @@ export default function Home() {
     } finally {
       setLoading(false);
     }
+  };
+  
+  const generateAudioFromTranscript = async (text: string, provider: "elevenlabs" | "cartesia") => {
+    const isElevenLabs = provider === "elevenlabs";
+    const voiceId = isElevenLabs ? elevenLabsVoiceId : cartesiaVoiceId;
+    const modelId = isElevenLabs ? elevenLabsModelId : cartesiaModelId;
+    const startTime = performance.now();
+    
+    if (isElevenLabs) {
+      setElevenLabsLoading(true);
+    } else {
+      setCartesiaLoading(true);
+    }
+    
+    await streamAudioFromProvider(text, provider, voiceId, modelId, startTime);
   };
   
 
@@ -259,19 +446,19 @@ export default function Home() {
               htmlFor="transcript"
               className="block text-sm font-medium text-gray-700 dark:text-gray-300"
             >
-              Realtime Transcription (Deepgram):
+              Your Prompt (type or dictate):
             </label>
             <button
               type="button"
               onClick={toggleRecording}
-              disabled={isConnecting}
+              disabled={isConnecting || isStreamingOpenAI}
               className={`px-4 py-2 rounded-lg font-medium transition-colors ${
                 isRecording
                   ? "bg-red-600 hover:bg-red-700 text-white"
                   : "bg-green-600 hover:bg-green-700 text-white disabled:bg-gray-400"
               }`}
             >
-              {isRecording ? "🔴 Stop Recording" : "🎤 Start Recording"}
+              {isRecording ? "🔴 Stop Dictation" : "🎤 Dictate"}
             </button>
           </div>
           {isConnecting && (
@@ -288,15 +475,39 @@ export default function Home() {
             id="transcript"
             value={transcript}
             onChange={(e) => setTranscript(e.target.value)}
-            placeholder="Start recording to see realtime transcription..."
+            placeholder="Type your prompt or use dictation..."
             className="w-full h-32 px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent dark:bg-gray-700 dark:text-white resize-none"
-            disabled={isRecording}
+            disabled={isRecording || isStreamingOpenAI}
           />
+          <button
+            type="button"
+            onClick={handleSubmitPrompt}
+            disabled={!transcript.trim() || isStreamingOpenAI}
+            className="mt-3 w-full bg-blue-600 hover:bg-blue-700 disabled:bg-gray-400 text-white font-medium py-3 px-4 rounded-lg transition-colors"
+          >
+            {isStreamingOpenAI ? "⏳ Getting Response..." : "🚀 Submit Prompt"}
+          </button>
         </div>
 
         {error && (
           <div className="bg-red-100 dark:bg-red-900 border border-red-400 dark:border-red-700 text-red-700 dark:text-red-200 px-4 py-3 rounded-lg mb-6">
             {error}
+          </div>
+        )}
+        
+        {openAIResponse && (
+          <div className="bg-white dark:bg-gray-800 rounded-lg shadow-lg p-6 mb-6">
+            <h2 className="text-xl font-semibold text-gray-900 dark:text-white mb-3">
+              🤖 OpenAI Response:
+            </h2>
+            <div className="prose dark:prose-invert max-w-none">
+              <p className="text-gray-700 dark:text-gray-300 whitespace-pre-wrap">{openAIResponse}</p>
+            </div>
+            {isStreamingOpenAI && (
+              <div className="mt-3 text-sm text-blue-600 dark:text-blue-400 animate-pulse">
+                ⏳ Streaming response...
+              </div>
+            )}
           </div>
         )}
 
@@ -349,14 +560,13 @@ export default function Home() {
               </select>
             </div>
             
-            <button
-              type="button"
-              onClick={() => generateAudioFromTranscript(transcript, "elevenlabs")}
-              disabled={elevenLabsLoading || !transcript.trim()}
-              className="w-full bg-indigo-600 hover:bg-indigo-700 disabled:bg-gray-400 text-white font-medium py-3 px-4 rounded-lg transition-colors mb-4"
-            >
-              {elevenLabsLoading ? "Generating..." : "Generate Audio"}
-            </button>
+            {elevenLabsLoading && (
+              <div className="mb-4 p-3 bg-indigo-50 dark:bg-indigo-900/20 rounded-lg text-sm text-center">
+                <div className="text-indigo-600 dark:text-indigo-400 animate-pulse">
+                  🎵 Generating audio...
+                </div>
+              </div>
+            )}
             
             {elevenLabsAudioTime !== null && (
               <div className="mb-4 p-3 bg-indigo-50 dark:bg-indigo-900/20 rounded-lg text-sm">
@@ -426,14 +636,13 @@ export default function Home() {
               </select>
             </div>
             
-            <button
-              type="button"
-              onClick={() => generateAudioFromTranscript(transcript, "cartesia")}
-              disabled={cartesiaLoading || !transcript.trim()}
-              className="w-full bg-purple-600 hover:bg-purple-700 disabled:bg-gray-400 text-white font-medium py-3 px-4 rounded-lg transition-colors mb-4"
-            >
-              {cartesiaLoading ? "Generating..." : "Generate Audio"}
-            </button>
+            {cartesiaLoading && (
+              <div className="mb-4 p-3 bg-purple-50 dark:bg-purple-900/20 rounded-lg text-sm text-center">
+                <div className="text-purple-600 dark:text-purple-400 animate-pulse">
+                  🎵 Generating audio...
+                </div>
+              </div>
+            )}
             
             {cartesiaAudioTime !== null && (
               <div className="mb-4 p-3 bg-purple-50 dark:bg-purple-900/20 rounded-lg text-sm">

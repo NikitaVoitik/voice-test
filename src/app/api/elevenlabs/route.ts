@@ -1,5 +1,5 @@
 import { ElevenLabsClient } from "@elevenlabs/elevenlabs-js";
-import { type NextRequest, NextResponse } from "next/server";
+import { type NextRequest } from "next/server";
 
 // Default voice: Rachel (one of the free voices)
 const DEFAULT_VOICE_ID = "21m00Tcm4TlvDq8ikWAM";
@@ -10,14 +10,20 @@ export async function POST(request: NextRequest) {
     const { text, voiceId, modelId } = await request.json();
 
     if (!text) {
-      return NextResponse.json({ error: "Text is required" }, { status: 400 });
+      return new Response(JSON.stringify({ error: "Text is required" }), { 
+        status: 400,
+        headers: { "Content-Type": "application/json" }
+      });
     }
 
     const apiKey = process.env.ELEVENLABS_API_KEY;
     if (!apiKey) {
-      return NextResponse.json(
-        { error: "ElevenLabs API key not configured" },
-        { status: 500 },
+      return new Response(
+        JSON.stringify({ error: "ElevenLabs API key not configured" }),
+        { 
+          status: 500,
+          headers: { "Content-Type": "application/json" }
+        }
       );
     }
 
@@ -31,30 +37,41 @@ export async function POST(request: NextRequest) {
       modelId: selectedModelId,
     });
 
-    // Convert the audio stream to buffer
-    const chunks: Uint8Array[] = [];
-    const reader = audio.getReader();
+    // Create a ReadableStream that forwards the audio chunks
+    const stream = new ReadableStream({
+      async start(controller) {
+        try {
+          const reader = audio.getReader();
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (value) {
+              controller.enqueue(value);
+            }
+          }
+          controller.close();
+        } catch (error) {
+          console.error("ElevenLabs streaming error:", error);
+          controller.error(error);
+        }
+      },
+    });
 
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      if (value) chunks.push(value);
-    }
-
-    const buffer = Buffer.concat(chunks);
-
-    return new NextResponse(buffer, {
+    return new Response(stream, {
       status: 200,
       headers: {
         "Content-Type": "audio/mpeg",
-        "Content-Length": buffer.length.toString(),
+        "Transfer-Encoding": "chunked",
       },
     });
   } catch (error) {
     console.error("ElevenLabs API error:", error);
-    return NextResponse.json(
-      { error: "Failed to generate audio with ElevenLabs" },
-      { status: 500 },
+    return new Response(
+      JSON.stringify({ error: "Failed to generate audio with ElevenLabs" }),
+      { 
+        status: 500,
+        headers: { "Content-Type": "application/json" }
+      }
     );
   }
 }
