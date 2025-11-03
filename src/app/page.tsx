@@ -394,7 +394,7 @@ export default function Home() {
       }
       
       // Combine all chunks into a single blob
-      const blob = new Blob(chunks, { type: "audio/mpeg" });
+      const blob = new Blob(chunks as BlobPart[], { type: "audio/mpeg" });
       const audioUrl = URL.createObjectURL(blob);
       
       const audioTime = performance.now() - startTime;
